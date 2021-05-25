@@ -25,7 +25,7 @@ const App = () => {
 
     function onSubmit(e: any) {
         setMessages(prev => [...prev, { message, from: null }])
-        tauri.invoke('plugin:libp2p|send', { message })
+        tauri.invoke('plugin:libp2p|broadcast', { message })
         setMessage('')
 
         e.preventDefault();
