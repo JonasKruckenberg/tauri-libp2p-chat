@@ -2,7 +2,7 @@
   all(not(debug_assertions), target_os = "windows"),
   windows_subsystem = "windows"
 )]
-mod libp2p_plugin;
+pub mod libp2p_plugin;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

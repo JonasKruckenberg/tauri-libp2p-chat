@@ -1,54 +1,32 @@
 use libp2p::{
-  core::upgrade,
   floodsub::{Floodsub, FloodsubEvent, Topic},
   identity,
   mdns::{Mdns, MdnsConfig, MdnsEvent},
-  mplex, noise,
   swarm::SwarmBuilder,
-  tcp::TokioTcpConfig,
-  NetworkBehaviour, PeerId, Transport,
+  PeerId,
 };
 use serde::Serialize;
 use tauri::{plugin::Plugin, Invoke, Manager, Params, State, Window};
 use tokio::sync::mpsc;
+pub mod behaviour;
+pub mod transport;
 
+/// Commands the tauri thread can use to control the libp2p thread
 #[derive(Debug)]
 enum NodeCommand {
   Message { message: String, from: String },
 }
 
+/// Events the webview can receive from the libp2p thread
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum NodeEvent {
   Message { message: String, from: String },
 }
 
-#[derive(Debug)]
-enum BehaviourEvent {
-  MdnsEvent(MdnsEvent),
-  FloodsubEvent(FloodsubEvent),
-}
-
-#[derive(NetworkBehaviour)]
-#[behaviour(out_event = "BehaviourEvent", event_process = false)]
-struct Behaviour {
-  mdns: Mdns,
-  floodsub: Floodsub,
-}
-
-impl From<MdnsEvent> for BehaviourEvent {
-  fn from(event: MdnsEvent) -> Self {
-    BehaviourEvent::MdnsEvent(event)
-  }
-}
-impl From<FloodsubEvent> for BehaviourEvent {
-  fn from(event: FloodsubEvent) -> Self {
-    BehaviourEvent::FloodsubEvent(event)
-  }
-}
-
+/// Broadcast a message to all listening floodsub peers
 #[tauri::command]
-async fn send(
+async fn broadcast(
   message: String,
   peer_id: State<'_, PeerId>,
   cmd_tx: State<'_, tauri::async_runtime::Sender<NodeCommand>>,
@@ -70,7 +48,7 @@ pub struct TauriLibp2p<P: Params> {
 impl<P: Params> TauriLibp2p<P> {
   pub fn new() -> Self {
     Self {
-      invoke_handler: Box::new(tauri::generate_handler![send]),
+      invoke_handler: Box::new(tauri::generate_handler![broadcast]),
     }
   }
 }
@@ -98,34 +76,19 @@ impl<P: Params> Plugin<P> for TauriLibp2p<P> {
 
     // spawn the libp2p node
     tauri::async_runtime::spawn(async move {
-      let noise_keys = noise::Keypair::<noise::X25519Spec>::new()
-        .into_authentic(&id_keys)
-        .expect("Signing libp2p-noise static DH keypair failed.");
+      let transport = transport::tokio_tcp_noise_mplex(id_keys);
 
-      // Create a transport.
-      let transport = TokioTcpConfig::new()
-        .nodelay(true)
-        .upgrade(upgrade::Version::V1)
-        .authenticate(noise::NoiseConfig::xx(noise_keys).into_authenticated())
-        .multiplex(mplex::MplexConfig::new())
-        .boxed();
+      let mut behaviour = behaviour::Behaviour::new(peer_id.clone()).await;
 
       let floodsub_topic = Topic::new("chat");
 
-      let mut swarm = {
-        let mut behaviour = Behaviour {
-          mdns: Mdns::new(MdnsConfig::default()).await.unwrap(),
-          floodsub: Floodsub::new(peer_id.clone()),
-        };
+      behaviour.floodsub.subscribe(floodsub_topic.clone());
 
-        behaviour.floodsub.subscribe(floodsub_topic.clone());
-
-        SwarmBuilder::new(transport, behaviour, peer_id)
+      let mut swarm = SwarmBuilder::new(transport, behaviour, peer_id)
           .executor(Box::new(|fut| {
             tokio::spawn(fut);
           }))
-          .build()
-      };
+          .build();
 
       swarm
         .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
@@ -142,17 +105,17 @@ impl<P: Params> Plugin<P> for TauriLibp2p<P> {
           }
           event = swarm.next() => {
             match event {
-              BehaviourEvent::MdnsEvent(MdnsEvent::Discovered(peers)) => {
+              behaviour::BehaviourEvent::MdnsEvent(MdnsEvent::Discovered(peers)) => {
                 for (peer, _) in peers {
                   swarm.behaviour_mut().floodsub.add_node_to_partial_view(peer);
                 }
               }
-              BehaviourEvent::MdnsEvent(MdnsEvent::Expired(expired)) => {
+              behaviour::BehaviourEvent::MdnsEvent(MdnsEvent::Expired(expired)) => {
                 for (peer, _) in expired {
                   swarm.behaviour_mut().floodsub.remove_node_from_partial_view(&peer);
                 }
               }
-              BehaviourEvent::FloodsubEvent(FloodsubEvent::Message(message)) => {
+              behaviour::BehaviourEvent::FloodsubEvent(FloodsubEvent::Message(message)) => {
                 let from = message.source.to_base58();
                 let message = String::from_utf8_lossy(&message.data).into_owned();
 
